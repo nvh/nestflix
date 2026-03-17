@@ -188,6 +188,7 @@ struct NestFlix: AsyncParsableCommand {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
         process.arguments = [
+            "-nostdin",
             "-f", "concat",
             "-safe", "0",
             "-i", listFile.path,
@@ -195,6 +196,7 @@ struct NestFlix: AsyncParsableCommand {
             "-y",
             output,
         ]
+        process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()
@@ -206,6 +208,7 @@ struct NestFlix: AsyncParsableCommand {
             let process2 = Process()
             process2.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
             process2.arguments = [
+                "-nostdin",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", listFile.path,
@@ -214,6 +217,7 @@ struct NestFlix: AsyncParsableCommand {
                 "-y",
                 output,
             ]
+            process2.standardInput = FileHandle.nullDevice
             try process2.run()
             process2.waitUntilExit()
             guard process2.terminationStatus == 0 else {
