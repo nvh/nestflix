@@ -24,6 +24,9 @@ struct NestFlix: AsyncParsableCommand {
     @Flag(name: .long, help: "Show YAVG debug values during trim detection")
     var debug: Bool = false
 
+    @Flag(name: .long, help: "Keep empty birdhouse segments (skip entropy filtering)")
+    var keepEmpty: Bool = false
+
     func run() async throws {
         let status = await requestPhotoAccess()
         guard status == .authorized || status == .limited else {
@@ -60,9 +63,9 @@ struct NestFlix: AsyncParsableCommand {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
+        // Pass 1: Export, remove flashes, extract stable segments, measure entropy
         print("Exporting and analyzing videos...")
-        var segmentPaths: [URL] = []
-        var totalDuration: Double = 0
+        var allSegments: [(url: URL, duration: Double, entropy: Double)] = []
         for (i, asset) in videos.enumerated() {
             let url = try await exportVideo(asset: asset, to: tempDir, index: i)
             let stableRanges = findStableSegments(in: url, debug: debug)
@@ -75,20 +78,60 @@ struct NestFlix: AsyncParsableCommand {
             )
             let trimmedDuration = stableRanges.reduce(0.0) { $0 + ($1.1 - $1.0) }
             let removedDuration = asset.duration - trimmedDuration
-            segmentPaths.append(contentsOf: extracted)
-            totalDuration += trimmedDuration
+
+            for segURL in extracted {
+                let entropy = analyzeEntropy(in: segURL)
+                let segDuration = stableRanges.reduce(0.0) { $0 + ($1.1 - $1.0) } / Double(extracted.count)
+                allSegments.append((url: segURL, duration: segDuration, entropy: entropy))
+            }
+
             if removedDuration > 0.2 {
-                print("  [\(i + 1)/\(videos.count)] \(url.lastPathComponent) → \(stableRanges.count) segments (removed \(String(format: "%.1f", removedDuration))s of flashes)")
+                print("  [\(i + 1)/\(videos.count)] \(url.lastPathComponent) → \(extracted.count) segments (removed \(String(format: "%.1f", removedDuration))s of flashes)")
             } else {
                 print("  [\(i + 1)/\(videos.count)] \(url.lastPathComponent)")
             }
         }
 
-        guard !segmentPaths.isEmpty else {
+        guard !allSegments.isEmpty else {
             print("No usable video segments found.")
             throw ExitCode.failure
         }
 
+        // Pass 2: Filter out empty birdhouse segments by entropy
+        let keptSegments: [(url: URL, duration: Double, entropy: Double)]
+        if keepEmpty {
+            keptSegments = allSegments
+        } else {
+            let entropies = allSegments.map(\.entropy).sorted()
+            let median = entropies[entropies.count / 2]
+            let mad = entropies.map { abs($0 - median) }.sorted()[entropies.count / 2]
+            let threshold = median - 1.0 * max(mad, 0.01)
+
+            if debug {
+                print("Entropy stats: median=\(String(format: "%.4f", median)) MAD=\(String(format: "%.4f", mad)) threshold=\(String(format: "%.4f", threshold))")
+            }
+
+            keptSegments = allSegments.filter { seg in
+                let keep = seg.entropy >= threshold
+                if debug {
+                    print("    \(seg.url.lastPathComponent) entropy=\(String(format: "%.4f", seg.entropy))\(keep ? "" : " (empty, skipped)")")
+                }
+                return keep
+            }
+
+            let removed = allSegments.count - keptSegments.count
+            if removed > 0 {
+                print("Filtered \(removed) empty segment\(removed == 1 ? "" : "s") by entropy")
+            }
+        }
+
+        guard !keptSegments.isEmpty else {
+            print("No segments remaining after filtering.")
+            throw ExitCode.failure
+        }
+
+        let totalDuration = keptSegments.reduce(0.0) { $0 + $1.duration }
+        let segmentPaths = keptSegments.map(\.url)
         print("Stitching \(segmentPaths.count) segments (\(formatDuration(totalDuration)) total)...")
         try stitchVideos(paths: segmentPaths, output: output, totalDuration: totalDuration)
         print("Done! Output: \(output)")
@@ -333,6 +376,52 @@ struct NestFlix: AsyncParsableCommand {
 
         process.waitUntilExit()
         return samples
+    }
+
+    /// Run ffmpeg entropy filter on an extracted segment, return mean normalized entropy.
+    func analyzeEntropy(in url: URL) -> Double {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+        process.arguments = [
+            "-nostdin",
+            "-i", url.path,
+            "-vf", "entropy,metadata=print:key=lavfi.entropy.normalized_entropy.normal.Y",
+            "-f", "null", "-",
+        ]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        let pipe = Pipe()
+        process.standardError = pipe
+
+        do { try process.run() } catch { return 0 }
+
+        var values: [Double] = []
+        var leftover = ""
+        let handle = pipe.fileHandleForReading
+
+        while true {
+            let data = handle.availableData
+            if data.isEmpty { break }
+            let chunk = leftover + (String(data: data, encoding: .utf8) ?? "")
+            let lines = chunk.components(separatedBy: "\n")
+            leftover = lines.last ?? ""
+
+            for line in lines.dropLast() {
+                if line.contains("lavfi.entropy.normalized_entropy.normal.Y=") {
+                    if let range = line.range(of: "lavfi.entropy.normalized_entropy.normal.Y=") {
+                        let rest = line[range.upperBound...]
+                        let numStr = rest.prefix(while: { $0.isNumber || $0 == "." })
+                        if let val = Double(numStr) {
+                            values.append(val)
+                        }
+                    }
+                }
+            }
+        }
+
+        process.waitUntilExit()
+        guard !values.isEmpty else { return 0 }
+        return values.reduce(0, +) / Double(values.count)
     }
 
     /// Extract specific time ranges from a video into separate files.
