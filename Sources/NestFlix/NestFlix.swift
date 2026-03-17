@@ -18,8 +18,11 @@ struct NestFlix: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "List albums and exit")
     var listAlbums: Bool = false
 
-    @Flag(name: .shortAndLong, help: "Only include favorited videos")
-    var favorites: Bool = false
+    @Flag(name: .shortAndLong, help: "Include all videos, not just favorites")
+    var all: Bool = false
+
+    @Flag(name: .long, help: "Show YAVG debug values during trim detection")
+    var debug: Bool = false
 
     func run() async throws {
         let status = await requestPhotoAccess()
@@ -45,7 +48,7 @@ struct NestFlix: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        let videos = fetchVideos(from: album, favoritesOnly: favorites)
+        let videos = fetchVideos(from: album, favoritesOnly: !all)
         guard !videos.isEmpty else {
             print("No videos found in album '\(albumName)'.")
             throw ExitCode.failure
@@ -57,16 +60,37 @@ struct NestFlix: AsyncParsableCommand {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        print("Exporting videos...")
-        var exportedPaths: [URL] = []
+        print("Exporting and analyzing videos...")
+        var segmentPaths: [URL] = []
+        var totalDuration: Double = 0
         for (i, asset) in videos.enumerated() {
             let url = try await exportVideo(asset: asset, to: tempDir, index: i)
-            exportedPaths.append(url)
-            print("  [\(i + 1)/\(videos.count)] Exported \(url.lastPathComponent)")
+            let stableRanges = findStableSegments(in: url, debug: debug)
+            if stableRanges.isEmpty {
+                print("  [\(i + 1)/\(videos.count)] \(url.lastPathComponent) — no stable segments, skipped")
+                continue
+            }
+            let extracted = try extractSegments(
+                from: url, ranges: stableRanges, tempDir: tempDir, prefix: String(format: "%04d", i)
+            )
+            let trimmedDuration = stableRanges.reduce(0.0) { $0 + ($1.1 - $1.0) }
+            let removedDuration = asset.duration - trimmedDuration
+            segmentPaths.append(contentsOf: extracted)
+            totalDuration += trimmedDuration
+            if removedDuration > 0.2 {
+                print("  [\(i + 1)/\(videos.count)] \(url.lastPathComponent) → \(stableRanges.count) segments (removed \(String(format: "%.1f", removedDuration))s of flashes)")
+            } else {
+                print("  [\(i + 1)/\(videos.count)] \(url.lastPathComponent)")
+            }
         }
 
-        print("Stitching \(exportedPaths.count) videos...")
-        try stitchVideos(paths: exportedPaths, output: output)
+        guard !segmentPaths.isEmpty else {
+            print("No usable video segments found.")
+            throw ExitCode.failure
+        }
+
+        print("Stitching \(segmentPaths.count) segments (\(formatDuration(totalDuration)) total)...")
+        try stitchVideos(paths: segmentPaths, output: output, totalDuration: totalDuration)
         print("Done! Output: \(output)")
     }
 
@@ -113,7 +137,7 @@ struct NestFlix: AsyncParsableCommand {
         } else {
             options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
         }
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+        // No sort — respect the album's manual ordering
         let result = PHAsset.fetchAssets(in: album, options: options)
         var assets: [PHAsset] = []
         result.enumerateObjects { asset, _, _ in
@@ -179,54 +203,277 @@ struct NestFlix: AsyncParsableCommand {
         }
     }
 
-    func stitchVideos(paths: [URL], output: String) throws {
+    /// Analyze the full video and return time ranges of stable segments.
+    /// Unstable regions (IR flash transitions) are excluded.
+    func findStableSegments(in url: URL, debug: Bool = false) -> [(Double, Double)] {
+        let samples = analyzeLuminance(in: url, debug: debug)
+        guard samples.count > 10 else {
+            // Too short to analyze, return the whole thing
+            if let last = samples.last {
+                return [(0, last.0)]
+            }
+            return []
+        }
+
+        // Mark each frame as stable or unstable based on local rate of change.
+        // A frame is "unstable" if the YAVG delta from the previous frame exceeds threshold.
+        let stabilityThreshold = 3.0
+        var isStable = [Bool](repeating: true, count: samples.count)
+        for i in 1..<samples.count {
+            let delta = abs(samples[i].1 - samples[i - 1].1)
+            if delta > stabilityThreshold {
+                isStable[i] = false
+            }
+        }
+        // First frame inherits from second
+        if samples.count > 1 { isStable[0] = isStable[1] }
+
+        // Expand unstable regions: mark frames near unstable ones as unstable too.
+        // This catches the ramp-up/down on both sides of a flash.
+        let expandFrames = 5
+        var expanded = isStable
+        for i in 0..<samples.count {
+            if !isStable[i] {
+                for j in max(0, i - expandFrames)...min(samples.count - 1, i + expandFrames) {
+                    expanded[j] = false
+                }
+            }
+        }
+
+        // Build stable time ranges from consecutive stable frames
+        var ranges: [(Double, Double)] = []
+        var rangeStart: Double? = nil
+        for i in 0..<samples.count {
+            if expanded[i] {
+                if rangeStart == nil {
+                    rangeStart = samples[i].0
+                }
+            } else {
+                if let start = rangeStart {
+                    let end = samples[i].0
+                    if end - start > 0.3 { // Only keep segments longer than 0.3s
+                        ranges.append((start, end))
+                    }
+                    rangeStart = nil
+                }
+            }
+        }
+        // Close final range
+        if let start = rangeStart, let last = samples.last {
+            let end = last.0
+            if end - start > 0.3 {
+                ranges.append((start, end))
+            }
+        }
+
+        if debug {
+            for (start, end) in ranges {
+                print("    → Stable: \(String(format: "%.2f", start))s–\(String(format: "%.2f", end))s")
+            }
+        }
+
+        return ranges
+    }
+
+    /// Run ffmpeg signalstats on the full video, return (timestamp, yavg) pairs.
+    func analyzeLuminance(in url: URL, debug: Bool = false) -> [(Double, Double)] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+        process.arguments = [
+            "-nostdin",
+            "-i", url.path,
+            "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG",
+            "-f", "null", "-",
+        ]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        let pipe = Pipe()
+        process.standardError = pipe
+
+        do { try process.run() } catch { return [] }
+
+        // Read incrementally to avoid pipe buffer deadlock
+        var samples: [(Double, Double)] = []
+        var currentPTS: Double = 0
+        var leftover = ""
+        let handle = pipe.fileHandleForReading
+
+        while true {
+            let data = handle.availableData
+            if data.isEmpty { break }
+            let chunk = leftover + (String(data: data, encoding: .utf8) ?? "")
+            let lines = chunk.components(separatedBy: "\n")
+            // Last element may be incomplete, save for next iteration
+            leftover = lines.last ?? ""
+
+            for line in lines.dropLast() {
+                if line.contains("pts_time:") {
+                    if let range = line.range(of: "pts_time:") {
+                        let rest = line[range.upperBound...]
+                        let numStr = rest.prefix(while: { $0.isNumber || $0 == "." })
+                        if let pts = Double(numStr) {
+                            currentPTS = pts
+                        }
+                    }
+                }
+                if line.contains("lavfi.signalstats.YAVG=") {
+                    if let range = line.range(of: "lavfi.signalstats.YAVG=") {
+                        let rest = line[range.upperBound...]
+                        let numStr = rest.prefix(while: { $0.isNumber || $0 == "." })
+                        if let yavg = Double(numStr) {
+                            if debug {
+                                print("    t=\(String(format: "%.3f", currentPTS)) YAVG=\(String(format: "%.1f", yavg))")
+                            }
+                            samples.append((currentPTS, yavg))
+                        }
+                    }
+                }
+            }
+        }
+
+        process.waitUntilExit()
+        return samples
+    }
+
+    /// Extract specific time ranges from a video into separate files.
+    func extractSegments(from url: URL, ranges: [(Double, Double)], tempDir: URL, prefix: String) throws -> [URL] {
+        var paths: [URL] = []
+        for (j, range) in ranges.enumerated() {
+            let segURL = tempDir.appendingPathComponent("\(prefix)_seg\(String(format: "%03d", j)).mp4")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+            process.arguments = [
+                "-nostdin",
+                "-ss", String(format: "%.3f", range.0),
+                "-to", String(format: "%.3f", range.1),
+                "-i", url.path,
+                "-c", "copy",
+                "-y", segURL.path,
+            ]
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                paths.append(segURL)
+            }
+        }
+        return paths
+    }
+
+    func formatDuration(_ seconds: Double) -> String {
+        let h = Int(seconds) / 3600
+        let m = (Int(seconds) % 3600) / 60
+        let s = Int(seconds) % 60
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, s)
+        }
+        return String(format: "%d:%02d", m, s)
+    }
+
+    func stitchVideos(paths: [URL], output: String, totalDuration: Double) throws {
         let listFile = paths.first!.deletingLastPathComponent()
             .appendingPathComponent("filelist.txt")
         let content = paths.map { "file '\($0.path)'" }.joined(separator: "\n")
         try content.write(to: listFile, atomically: true, encoding: .utf8)
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
-        process.arguments = [
+        // Try stream copy first (fast)
+        let copyResult = try runFFmpeg(args: [
             "-nostdin",
-            "-f", "concat",
-            "-safe", "0",
+            "-f", "concat", "-safe", "0",
             "-i", listFile.path,
-            "-c", "copy",
-            "-y",
-            output,
-        ]
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
+            "-c", "copy", "-y", output,
+        ], totalDuration: totalDuration)
 
-        guard process.terminationStatus == 0 else {
-            // Retry with re-encoding if stream copy fails
-            print("Stream copy failed, re-encoding...")
-            let process2 = Process()
-            process2.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
-            process2.arguments = [
+        if !copyResult {
+            // Fall back to re-encoding
+            print("\rStream copy failed, re-encoding...")
+            let encodeResult = try runFFmpeg(args: [
                 "-nostdin",
-                "-f", "concat",
-                "-safe", "0",
+                "-f", "concat", "-safe", "0",
                 "-i", listFile.path,
-                "-c:v", "h264",
-                "-c:a", "aac",
-                "-y",
-                output,
-            ]
-            process2.standardInput = FileHandle.nullDevice
-            try process2.run()
-            process2.waitUntilExit()
-            guard process2.terminationStatus == 0 else {
+                "-c:v", "h264", "-c:a", "aac", "-y", output,
+            ], totalDuration: totalDuration)
+            guard encodeResult else {
                 throw NSError(
                     domain: "NestFlix", code: 4,
                     userInfo: [NSLocalizedDescriptionKey: "ffmpeg failed"]
                 )
             }
-            return
         }
+        // Clear the progress line
+        print()
+    }
+
+    /// Runs ffmpeg with progress output. Returns true on success.
+    func runFFmpeg(args: [String], totalDuration: Double) throws -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+        process.arguments = args
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+
+        let pipe = Pipe()
+        process.standardError = pipe
+
+        try process.run()
+
+        let handle = pipe.fileHandleForReading
+        var buffer = Data()
+
+        while process.isRunning {
+            let data = handle.availableData
+            if data.isEmpty { break }
+            buffer.append(data)
+
+            // Parse ffmpeg stderr for time= progress lines
+            if let str = String(data: buffer, encoding: .utf8) {
+                let lines = str.components(separatedBy: "\r")
+                for line in lines {
+                    if let range = line.range(of: "time=") {
+                        let timeStr = String(line[range.upperBound...]).prefix(11)
+                        if let seconds = parseFFmpegTime(String(timeStr)), totalDuration > 0 {
+                            let pct = min(100, Int(seconds / totalDuration * 100))
+                            print("\r  Progress: \(pct)% (\(formatDuration(seconds)) / \(formatDuration(totalDuration)))", terminator: "")
+                            fflush(stdout)
+                        }
+                    }
+                }
+                // Keep only the last incomplete line in the buffer
+                if let lastR = str.lastIndex(of: "\r") {
+                    let remaining = str[str.index(after: lastR)...]
+                    buffer = Data(remaining.utf8)
+                }
+            }
+        }
+
+        // Read remaining data
+        let remaining = handle.readDataToEndOfFile()
+        if !remaining.isEmpty, let str = String(data: remaining, encoding: .utf8) {
+            for line in str.components(separatedBy: "\r") {
+                if let range = line.range(of: "time=") {
+                    let timeStr = String(line[range.upperBound...]).prefix(11)
+                    if let seconds = parseFFmpegTime(String(timeStr)), totalDuration > 0 {
+                        let pct = min(100, Int(seconds / totalDuration * 100))
+                        print("\r  Progress: \(pct)% (\(formatDuration(seconds)) / \(formatDuration(totalDuration)))", terminator: "")
+                        fflush(stdout)
+                    }
+                }
+            }
+        }
+
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+
+    /// Parse "HH:MM:SS.ms" time string from ffmpeg output
+    func parseFFmpegTime(_ str: String) -> Double? {
+        let parts = str.trimmingCharacters(in: .whitespaces).split(separator: ":")
+        guard parts.count == 3,
+              let h = Double(parts[0]),
+              let m = Double(parts[1]),
+              let s = Double(parts[2]) else { return nil }
+        return h * 3600 + m * 60 + s
     }
 }
