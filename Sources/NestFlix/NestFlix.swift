@@ -63,7 +63,6 @@ struct NestFlix: AsyncParsableCommand {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        // Pass 1: Export, remove flashes, extract stable segments, measure entropy
         print("Exporting and analyzing videos...")
         var allSegments: [(url: URL, duration: Double, entropy: Double)] = []
         for (i, asset) in videos.enumerated() {
@@ -79,10 +78,32 @@ struct NestFlix: AsyncParsableCommand {
             let trimmedDuration = stableRanges.reduce(0.0) { $0 + ($1.1 - $1.0) }
             let removedDuration = asset.duration - trimmedDuration
 
-            for segURL in extracted {
-                let entropy = analyzeEntropy(in: segURL)
-                let segDuration = stableRanges.reduce(0.0) { $0 + ($1.1 - $1.0) } / Double(extracted.count)
-                allSegments.append((url: segURL, duration: segDuration, entropy: entropy))
+            // Measure entropy per segment
+            let videoSegments = extracted.enumerated().map { (j, segURL) in
+                (url: segURL, duration: stableRanges[j].1 - stableRanges[j].0, entropy: analyzeEntropy(in: segURL))
+            }
+
+            // Per-video entropy filtering
+            if !keepEmpty && videoSegments.count >= 2 {
+                let sorted = videoSegments.map(\.entropy).sorted()
+                let median = sorted[sorted.count / 2]
+                var kept = 0
+                for seg in videoSegments {
+                    if seg.entropy >= median {
+                        allSegments.append(seg)
+                        kept += 1
+                    } else if debug {
+                        print("    \(seg.url.lastPathComponent) entropy=\(String(format: "%.4f", seg.entropy)) (empty, skipped)")
+                    }
+                }
+                if debug {
+                    for seg in videoSegments where seg.entropy >= median {
+                        print("    \(seg.url.lastPathComponent) entropy=\(String(format: "%.4f", seg.entropy))")
+                    }
+                    print("    threshold=\(String(format: "%.4f", median)), kept \(kept)/\(videoSegments.count)")
+                }
+            } else {
+                allSegments.append(contentsOf: videoSegments)
             }
 
             if removedDuration > 0.2 {
@@ -97,41 +118,8 @@ struct NestFlix: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        // Pass 2: Filter out empty birdhouse segments by entropy
-        let keptSegments: [(url: URL, duration: Double, entropy: Double)]
-        if keepEmpty {
-            keptSegments = allSegments
-        } else {
-            let entropies = allSegments.map(\.entropy).sorted()
-            let median = entropies[entropies.count / 2]
-            let mad = entropies.map { abs($0 - median) }.sorted()[entropies.count / 2]
-            let threshold = median - 1.0 * max(mad, 0.01)
-
-            if debug {
-                print("Entropy stats: median=\(String(format: "%.4f", median)) MAD=\(String(format: "%.4f", mad)) threshold=\(String(format: "%.4f", threshold))")
-            }
-
-            keptSegments = allSegments.filter { seg in
-                let keep = seg.entropy >= threshold
-                if debug {
-                    print("    \(seg.url.lastPathComponent) entropy=\(String(format: "%.4f", seg.entropy))\(keep ? "" : " (empty, skipped)")")
-                }
-                return keep
-            }
-
-            let removed = allSegments.count - keptSegments.count
-            if removed > 0 {
-                print("Filtered \(removed) empty segment\(removed == 1 ? "" : "s") by entropy")
-            }
-        }
-
-        guard !keptSegments.isEmpty else {
-            print("No segments remaining after filtering.")
-            throw ExitCode.failure
-        }
-
-        let totalDuration = keptSegments.reduce(0.0) { $0 + $1.duration }
-        let segmentPaths = keptSegments.map(\.url)
+        let totalDuration = allSegments.reduce(0.0) { $0 + $1.duration }
+        let segmentPaths = allSegments.map(\.url)
         print("Stitching \(segmentPaths.count) segments (\(formatDuration(totalDuration)) total)...")
         try stitchVideos(paths: segmentPaths, output: output, totalDuration: totalDuration)
         print("Done! Output: \(output)")
